@@ -41,6 +41,14 @@ rm(list = ls())
 set.seed(123)
 
 # ------------------------------------------------------------
+# Run mode
+# If RERUN_JAGS = TRUE, the models are fitted again using JAGS.
+# If RERUN_JAGS = FALSE, the previously saved fitted models are loaded.
+# ------------------------------------------------------------
+
+RERUN_JAGS <- FALSE
+
+# ------------------------------------------------------------
 # Project paths
 # This block defines the folder structure used to load data
 # and save the Task 1 outputs.
@@ -56,17 +64,13 @@ results_dir <- file.path(task_dir, "results")
 
 # Subfolders for Task 1 results.
 fits_dir <- file.path(results_dir, "fits")
-tables_dir <- file.path(results_dir, "tables")
 plots_dir <- file.path(results_dir, "plots")
 diagnostics_dir <- file.path(results_dir, "diagnostics")
-logs_dir <- file.path(results_dir, "logs")
 
 # Create result folders if they do not already exist.
 dir.create(fits_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(diagnostics_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(logs_dir, recursive = TRUE, showWarnings = FALSE)
 
 # Path to the input dataset.
 data_path <- file.path(data_dir, "hourly_load_factor.csv")
@@ -88,6 +92,28 @@ round_numeric_df <- function(df, digits = 4) {
   num_cols <- sapply(out, is.numeric)
   out[num_cols] <- lapply(out[num_cols], round, digits = digits)
   out
+}
+
+# Extract log-likelihood matrix: rows = posterior draws, columns = observations.
+extract_log_lik <- function(samps) {
+  do.call(
+    rbind,
+    lapply(samps, function(chain) {
+      chain[, grep("^log_lik\\[", colnames(chain)), drop = FALSE]
+    })
+  )
+}
+
+# Extract useful WAIC quantities into one row.
+waic_row <- function(w, H) {
+  e <- w$estimates
+  data.frame(
+    H = H,
+    ELPD = e["elpd_waic", "Estimate"],
+    p_eff = e["p_waic", "Estimate"],
+    WAIC = e["waic", "Estimate"],
+    SE = e["waic", "SE"]
+  )
 }
 
 # Print the run header.
@@ -118,15 +144,60 @@ empirical_range <- range(x)
 
 cat_step(paste0("Data loaded: n = ", n, " observations."))
 
+# Print empirical summaries.
+cat("\n1. EMPIRICAL ANALYSIS\n")
+cat("------------------------------------------------------------\n")
+cat("Number of observations:", n, "\n")
+cat("Range:", round(empirical_range[1], 4), "-", round(empirical_range[2], 4), "\n")
+cat("\nEmpirical summary:\n")
+print(empirical_summary)
+
+# Save the empirical distribution plot.
+png(
+  filename = file.path(plots_dir, "empirical_distribution.png"),
+  width = 1000,
+  height = 700
+)
+
+hist(
+  x,
+  breaks = 35,
+  freq = FALSE,
+  col = "tomato",
+  border = "white",
+  xlab = expression(x[i]),
+  ylab = "Density",
+  main = "Empirical distribution of the observed sample"
+)
+
+lines(
+  density(x, from = 0, to = 1),
+  col = "blue",
+  lwd = 2
+)
+
+rug(x)
+
+dev.off()
+
 # ------------------------------------------------------------
-# Single Beta model
-# We fit x_i | theta ~ Beta(alpha, beta), theta = (alpha, beta).
+# Model fitting or loading
 # ------------------------------------------------------------
 
-cat_step("[2/7] Fitting single Beta model, H = 1.")
+# Number of mixture components to test.
+H_grid <- 2:5
 
-# JAGS model for a single Beta distribution.
-model_beta_single <- "
+if (RERUN_JAGS) {
+  
+  # ------------------------------------------------------------
+  # Single Beta model
+  # We fit x_i | theta ~ Beta(alpha, beta), theta = (alpha, beta).
+  # ------------------------------------------------------------
+  
+  cat_step("[2/7] Fitting single Beta model, H = 1.")
+  
+  # JAGS model for a single Beta distribution.
+  model_beta_single <- "
 model {
 
   # Likelihood
@@ -187,16 +258,6 @@ samps_beta_single <- coda.samples(
   progress.bar = "none"
 )
 
-# Extract log-likelihood matrix: rows = posterior draws, columns = observations.
-extract_log_lik <- function(samps) {
-  do.call(
-    rbind,
-    lapply(samps, function(chain) {
-      chain[, grep("^log_lik\\[", colnames(chain)), drop = FALSE]
-    })
-  )
-}
-
 cat_step("Computing WAIC for single Beta model.")
 
 # Compute WAIC for the single Beta model.
@@ -226,18 +287,6 @@ cat_step("Completed single Beta model, H = 1.")
 # ------------------------------------------------------------
 
 cat_step("[3/7] Fitting Beta mixture models, H = 2, 3, 4, 5.")
-
-# Extract useful WAIC quantities into one row.
-waic_row <- function(w, H) {
-  e <- w$estimates
-  data.frame(
-    H = H,
-    ELPD = e["elpd_waic", "Estimate"],
-    p_eff = e["p_waic", "Estimate"],
-    WAIC = e["waic", "Estimate"],
-    SE = e["waic", "SE"]
-  )
-}
 
 # JAGS model for a Beta mixture with H components.
 model_beta_mixture <- "
@@ -286,9 +335,6 @@ inits_beta_mixture <- function(H) {
     )
   }
 }
-
-# Number of mixture components to test.
-H_grid <- 2:5
 
 # Empty lists to store fits and WAIC values.
 fits_beta_mixture <- vector("list", length(H_grid))
@@ -377,6 +423,37 @@ for (k in seq_along(H_grid)) {
       "."
     )
   )
+}
+
+} else {
+  
+  cat_step("[2/7] Loading previously saved fitted models.")
+  
+  # Load the single Beta model.
+  fit_beta_single <- readRDS(
+    file = file.path(fits_dir, "fit_beta_single_H1.rds")
+  )
+  
+  waic_beta_single <- fit_beta_single$waic
+  
+  # Load all mixture models.
+  fits_beta_mixture <- vector("list", length(H_grid))
+  waic_beta_mixture <- vector("list", length(H_grid))
+  
+  for (k in seq_along(H_grid)) {
+    
+    H <- H_grid[k]
+    
+    fits_beta_mixture[[k]] <- readRDS(
+      file = file.path(fits_dir, paste0("fit_beta_mixture_H", H, ".rds"))
+    )
+    
+    waic_beta_mixture[[k]] <- fits_beta_mixture[[k]]$waic
+    
+    cat_step(paste0("Loaded Beta mixture model, H = ", H, "."))
+  }
+  
+  cat_step("Previously saved fitted models loaded.")
 }
 
 # ------------------------------------------------------------
@@ -667,34 +744,6 @@ cat("\n============================================================\n")
 cat("HOURLY CITY LOAD FACTOR - BAYESIAN BETA MODELS\n")
 cat("============================================================\n")
 
-# Print empirical summaries.
-cat("\n1. EMPIRICAL ANALYSIS\n")
-cat("------------------------------------------------------------\n")
-cat("Number of observations:", n, "\n")
-cat("Range:", round(empirical_range[1], 4), "-", round(empirical_range[2], 4), "\n")
-cat("\nEmpirical summary:\n")
-print(empirical_summary)
-
-# Plot the empirical distribution.
-hist(
-  x,
-  breaks = 35,
-  freq = FALSE,
-  col = "tomato",
-  border = "white",
-  xlab = expression(x[i]),
-  ylab = "Density",
-  main = "Empirical distribution of the observed sample"
-)
-
-lines(
-  density(x, from = 0, to = 1),
-  col = "blue",
-  lwd = 2
-)
-
-rug(x)
-
 # Print MCMC diagnostic summaries.
 cat("\n2. MCMC DIAGNOSTICS\n")
 cat("------------------------------------------------------------\n")
@@ -711,19 +760,54 @@ for (k in seq_along(diagnostics_beta_mixture)) {
   print(round(diagnostics_beta_mixture[[k]]$effective_size, 2))
 }
 
-# Display diagnostic plots for the selected model.
-cat("\nDiagnostic plots for the selected model will now be displayed.\n")
+# Save diagnostic plots for the selected model.
+cat("\nDiagnostic plots for the selected model have been saved.\n")
 
 if (best_H == 1) {
   
+  png(
+    filename = file.path(plots_dir, "traceplot_selected_model.png"),
+    width = 1200,
+    height = 800
+  )
+  
   traceplot(diagnostics_beta_single$samples)
+  
+  dev.off()
+  
+  png(
+    filename = file.path(plots_dir, "autocorrelation_selected_model.png"),
+    width = 1200,
+    height = 800
+  )
+  
   autocorr.plot(diagnostics_beta_single$samples)
+  
+  dev.off()
   
 } else {
   
   best_fit_index <- which(H_grid == best_H)
+  
+  png(
+    filename = file.path(plots_dir, "traceplot_selected_model.png"),
+    width = 1200,
+    height = 800
+  )
+  
   traceplot(diagnostics_beta_mixture[[best_fit_index]]$samples)
+  
+  dev.off()
+  
+  png(
+    filename = file.path(plots_dir, "autocorrelation_selected_model.png"),
+    width = 1200,
+    height = 800
+  )
+  
   autocorr.plot(diagnostics_beta_mixture[[best_fit_index]]$samples)
+  
+  dev.off()
 }
 
 # Print posterior parameter summaries.
@@ -739,10 +823,16 @@ for (k in seq_along(param_summary_mixture)) {
   print(round_numeric_df(param_summary_mixture[[k]], 4))
 }
 
-# Plot the posterior predictive density of the selected model.
+# Save the posterior predictive density plot of the selected model.
 cat("\n4. POSTERIOR PREDICTIVE DENSITY\n")
 cat("------------------------------------------------------------\n")
 cat("Selected model according to WAIC: H =", best_H, "\n")
+
+png(
+  filename = file.path(plots_dir, "posterior_predictive_density_selected_model.png"),
+  width = 1000,
+  height = 700
+)
 
 hist(
   x,
@@ -776,6 +866,8 @@ legend(
   bty = "n"
 )
 
+dev.off()
+
 # Print the WAIC comparison.
 cat("\n5. WAIC MODEL COMPARISON\n")
 cat("------------------------------------------------------------\n")
@@ -785,7 +877,13 @@ print(round_numeric_df(waic_table, 3))
 
 cat("\nBest model according to WAIC: H =", best_H, "\n")
 
-# Plot WAIC as a function of the number of components.
+# Save WAIC plot as a function of the number of components.
+png(
+  filename = file.path(plots_dir, "waic_model_comparison.png"),
+  width = 1000,
+  height = 700
+)
+
 plot(
   waic_curve$H,
   waic_curve$WAIC,
@@ -806,6 +904,8 @@ arrows(
   length = 0.05
 )
 
+dev.off()
+
 # Print saved file paths.
 cat("\n6. SAVED OBJECTS\n")
 cat("------------------------------------------------------------\n")
@@ -817,5 +917,145 @@ for (H in H_grid) {
 }
 
 cat("- ", file.path(diagnostics_dir, "mcmc_diagnostics.rds"), "\n", sep = "")
+cat("- ", file.path(plots_dir, "empirical_distribution.png"), "\n", sep = "")
+cat("- ", file.path(plots_dir, "traceplot_selected_model.png"), "\n", sep = "")
+cat("- ", file.path(plots_dir, "autocorrelation_selected_model.png"), "\n", sep = "")
+cat("- ", file.path(plots_dir, "posterior_predictive_density_selected_model.png"), "\n", sep = "")
+cat("- ", file.path(plots_dir, "waic_model_comparison.png"), "\n", sep = "")
 
 cat("\nAnalysis completed.\n")
+
+
+# ------------------------------------------------------------
+# Selected model: H = 3
+# Posterior summaries and posterior plots
+# ------------------------------------------------------------
+
+best_H <- 3
+best_fit_index <- which(H_grid == best_H)
+
+cat_step(paste0("Computing posterior summaries and posterior plots for H = ", best_H, "."))
+
+# Extract posterior draws of the selected model.
+posterior_mat_raw <- as.matrix(fits_beta_mixture[[best_fit_index]]$samples)
+
+# Extract alpha, beta and p.
+alpha <- matrix(NA, nrow = nrow(posterior_mat_raw), ncol = best_H)
+beta  <- matrix(NA, nrow = nrow(posterior_mat_raw), ncol = best_H)
+p     <- matrix(NA, nrow = nrow(posterior_mat_raw), ncol = best_H)
+
+for (h in 1:best_H) {
+  alpha[, h] <- posterior_mat_raw[, paste0("alpha[", h, "]")]
+  beta[, h]  <- posterior_mat_raw[, paste0("beta[", h, "]")]
+  p[, h]     <- posterior_mat_raw[, paste0("p[", h, "]")]
+}
+
+# Order components by increasing posterior component mean.
+component_mean <- alpha / (alpha + beta)
+
+alpha_ord <- alpha
+beta_ord  <- beta
+p_ord     <- p
+
+for (s in 1:nrow(posterior_mat_raw)) {
+  ord <- order(component_mean[s, ])
+  alpha_ord[s, ] <- alpha[s, ord]
+  beta_ord[s, ]  <- beta[s, ord]
+  p_ord[s, ]     <- p[s, ord]
+}
+
+# Build posterior summary table.
+posterior_summary_H3 <- data.frame()
+
+for (h in 1:best_H) {
+  
+  alpha_h <- alpha_ord[, h]
+  beta_h  <- beta_ord[, h]
+  p_h     <- p_ord[, h]
+  
+  block <- data.frame(
+    Component = h,
+    Parameter = c("alpha", "beta", "p"),
+    Mean = c(mean(alpha_h), mean(beta_h), mean(p_h)),
+    Variance = c(var(alpha_h), var(beta_h), var(p_h)),
+    SD = c(sd(alpha_h), sd(beta_h), sd(p_h)),
+    Q2.5 = c(
+      quantile(alpha_h, 0.025),
+      quantile(beta_h, 0.025),
+      quantile(p_h, 0.025)
+    ),
+    Median = c(
+      quantile(alpha_h, 0.5),
+      quantile(beta_h, 0.5),
+      quantile(p_h, 0.5)
+    ),
+    Q97.5 = c(
+      quantile(alpha_h, 0.975),
+      quantile(beta_h, 0.975),
+      quantile(p_h, 0.975)
+    ),
+    row.names = NULL
+  )
+  
+  posterior_summary_H3 <- rbind(posterior_summary_H3, block)
+}
+
+# Save posterior summary table.
+write.csv(
+  posterior_summary_H3,
+  file = file.path(diagnostics_dir, "posterior_summary_selected_model_H3.csv"),
+  row.names = FALSE
+)
+
+# Create data frame for posterior plots.
+posterior_draws_H3 <- data.frame(
+  alpha_1 = alpha_ord[, 1],
+  beta_1  = beta_ord[, 1],
+  p_1     = p_ord[, 1],
+  alpha_2 = alpha_ord[, 2],
+  beta_2  = beta_ord[, 2],
+  p_2     = p_ord[, 2],
+  alpha_3 = alpha_ord[, 3],
+  beta_3  = beta_ord[, 3],
+  p_3     = p_ord[, 3]
+)
+
+# Save posterior draws.
+write.csv(
+  posterior_draws_H3,
+  file = file.path(diagnostics_dir, "posterior_draws_selected_model_H3.csv"),
+  row.names = FALSE
+)
+
+# Save one combined posterior plot.
+png(
+  filename = file.path(plots_dir, "posterior_distributions_selected_model_H3.png"),
+  width = 1400,
+  height = 1000
+)
+
+par(mfrow = c(3, 3))
+
+for (par_name in colnames(posterior_draws_H3)) {
+  
+  hist(
+    posterior_draws_H3[[par_name]],
+    breaks = 40,
+    freq = FALSE,
+    col = "lightgray",
+    border = "white",
+    xlab = par_name,
+    ylab = "Density",
+    main = paste("Posterior of", par_name)
+  )
+  
+  lines(
+    density(posterior_draws_H3[[par_name]]),
+    col = "blue",
+    lwd = 2
+  )
+}
+
+dev.off()
+
+cat_step("Posterior summaries and posterior plots for H = 3 saved.")
